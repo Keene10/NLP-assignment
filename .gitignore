@@ -1,0 +1,36 @@
+# 大文件/模型
+*.zip
+*.bin
+*.pkl
+*.pt
+*.pth
+*.safetensors
+项目/m3e-small/
+
+# 敏感信息
+.env
+*.key
+
+# 输出/缓存（可重新生成）
+项目/outputs/chart_images/
+项目/outputs/ocr_cache/
+项目/outputs/extracted_text_ocr/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
+
+# 数据库
+*.db
+*.sqlite

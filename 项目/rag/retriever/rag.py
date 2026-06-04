@@ -18,6 +18,7 @@ from config.config import (
 )
 from rag.llm.llm import LLMService
 from rag.retriever.page_index import PageTextIndex
+from rag.retriever.segment_router import SegmentRouter
 from rag.vector.vector_db import VectorDB
 
 
@@ -723,3 +724,343 @@ class RAGService:
             return top_source.get("filename"), top_source.get("page")
 
         return filename, page
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical RAG
+# ---------------------------------------------------------------------------
+
+
+class HierarchicalRAGService:
+    """Two-stage RAG: 1) LLM routes to a segment, 2) retrieve inside the segment.
+
+    For documents with only one segment (short PDFs) behaviour falls back to
+    the standard flat RAG.
+    """
+
+    def __init__(
+        self,
+        vector_db: VectorDB | None = None,
+        llm: LLMService | None = None,
+        page_index: PageTextIndex | None = None,
+        router: SegmentRouter | None = None,
+    ):
+        self.base = RAGService(
+            vector_db=vector_db,
+            llm=llm,
+            page_index=page_index,
+        )
+        self.router = router or SegmentRouter(llm=llm)
+
+    def retrieve_pages_hierarchical(
+        self,
+        query: str,
+        filename: str | None = None,
+        initial_k: int = 80,
+        final_pages: int = 5,
+        score_threshold: float = 0,
+        max_chars_per_page: int = 5000,
+        segment_expansion: int = 2,
+    ) -> tuple[list[RetrievedPage], dict]:
+        """Retrieve pages after optionally restricting to a segment.
+
+        Returns (pages, route_info) where route_info contains segment metadata
+        for debugging / logging.
+        """
+        route_info: dict = {
+            "hierarchical": False,
+            "filename": filename,
+            "segment": None,
+        }
+
+        segment = None
+        if filename:
+            segment = self.router.route(query, filename)
+
+        if segment is None or segment.segment_id == "all":
+            # No segmentation needed – fall back to flat retrieval
+            pages = self.base.retrieve_pages(
+                query,
+                initial_k=initial_k,
+                final_pages=final_pages,
+                score_threshold=score_threshold,
+                max_chars_per_page=max_chars_per_page,
+            )
+            return pages, route_info
+
+        route_info["hierarchical"] = True
+        route_info["segment"] = {
+            "id": segment.segment_id,
+            "title": segment.title,
+            "start_page": segment.start_page,
+            "end_page": segment.end_page,
+        }
+
+        # Expand the segment window slightly so that pages right on the
+        # boundary are not lost.
+        effective_start = max(1, segment.start_page - segment_expansion)
+        effective_end = segment.end_page + segment_expansion
+
+        # Increase initial_k because many top results may fall outside the
+        # segment and get filtered away.
+        enlarged_k = max(initial_k * 3, 200)
+
+        hits = self.base.vector_db.search(
+            query, k=enlarged_k, score_threshold=score_threshold
+        )
+        grouped: dict[tuple[str, str], dict] = {}
+
+        for rank, (doc, raw_score) in enumerate(hits, start=1):
+            metadata = doc.metadata or {}
+            hit_filename = metadata.get("filename") or metadata.get("source")
+            page_number = metadata.get("page_number") or metadata.get("page")
+            if not hit_filename or page_number is None:
+                continue
+
+            # ---- segment boundary filter ----
+            if hit_filename != filename:
+                continue
+            try:
+                page_int = int(page_number)
+            except (ValueError, TypeError):
+                continue
+            if page_int < effective_start or page_int > effective_end:
+                continue
+            # ----------------------------------
+
+            key = (hit_filename, str(page_number))
+            relevance = self.base.vector_db.relevance_score(raw_score)
+            group = grouped.setdefault(
+                key,
+                {
+                    "filename": hit_filename,
+                    "page_number": page_number,
+                    "best_score": relevance,
+                    "score_sum": 0.0,
+                    "hit_count": 0,
+                    "first_rank": rank,
+                    "chunk_ids": set(),
+                },
+            )
+            group["best_score"] = max(group["best_score"], relevance)
+            group["score_sum"] += relevance
+            group["hit_count"] += 1
+            group["first_rank"] = min(group["first_rank"], rank)
+            if metadata.get("chunk_id") is not None:
+                group["chunk_ids"].add(int(metadata["chunk_id"]))
+
+        if self.base.page_index is not None:
+            for candidate in self.base.page_index.rank(query, top_k=max(30, final_pages * 6)):
+                # ---- segment boundary filter for keyword hits ----
+                if candidate.filename != filename:
+                    continue
+                if candidate.page_number < effective_start or candidate.page_number > effective_end:
+                    continue
+                # --------------------------------------------------
+
+                key = (candidate.filename, str(candidate.page_number))
+                group = grouped.setdefault(
+                    key,
+                    {
+                        "filename": candidate.filename,
+                        "page_number": candidate.page_number,
+                        "best_score": 0.0,
+                        "score_sum": 0.0,
+                        "hit_count": 0,
+                        "first_rank": enlarged_k + 1,
+                        "chunk_ids": set(),
+                    },
+                )
+                group["keyword_score"] = max(
+                    group.get("keyword_score", 0.0),
+                    candidate.keyword_score,
+                )
+                group["bonus_score"] = max(
+                    group.get("bonus_score", 0.0),
+                    candidate.bonus_score,
+                )
+                key_tuple = (candidate.filename, int(candidate.page_number))
+                group["exact_score"] = max(
+                    group.get("exact_score", 0.0),
+                    self.base.page_index.exact_phrase_score(query, key_tuple),
+                )
+                group["early_penalty"] = max(
+                    group.get("early_penalty", 0.0),
+                    self.base.page_index.early_page_penalty(query, key_tuple),
+                )
+
+        max_vector_score = max((item.get("best_score", 0.0) for item in grouped.values()), default=1.0) or 1.0
+        max_keyword_score = max((item.get("keyword_score", 0.0) for item in grouped.values()), default=1.0) or 1.0
+        for group in grouped.values():
+            vector_part = group.get("best_score", 0.0) / max_vector_score
+            keyword_part = group.get("keyword_score", 0.0) / max_keyword_score
+            bonus_part = group.get("bonus_score", 0.0)
+            exact_part = group.get("exact_score", 0.0)
+            early_penalty = group.get("early_penalty", 0.0)
+            group["final_score"] = (
+                RETRIEVAL_VECTOR_WEIGHT * vector_part
+                + RETRIEVAL_KEYWORD_WEIGHT * keyword_part
+                + RETRIEVAL_BONUS_WEIGHT * bonus_part
+                + RETRIEVAL_EXACT_WEIGHT * exact_part
+                - RETRIEVAL_EARLY_PAGE_PENALTY * early_penalty
+            )
+
+        ranked_groups = sorted(
+            grouped.values(),
+            key=lambda item: (
+                item.get("final_score", item["best_score"]),
+                item["score_sum"] / max(item["hit_count"], 1),
+                item["hit_count"],
+                -item["first_rank"],
+            ),
+            reverse=True,
+        )
+
+        pages: list[RetrievedPage] = []
+        for group in ranked_groups[:final_pages]:
+            if self.base.page_index is not None:
+                content, selected_chunk_ids = self.base.page_index.build_page_content(
+                    group["filename"],
+                    group["page_number"],
+                    query=query,
+                    max_chars=max_chars_per_page,
+                    preferred_chunk_ids=group["chunk_ids"],
+                )
+                page_docs = self.base.page_index.get_documents_by_page(
+                    group["filename"],
+                    group["page_number"],
+                )
+            else:
+                page_docs = self.base.vector_db.get_documents_by_page(
+                    group["filename"],
+                    group["page_number"],
+                )
+                content = self.base._merge_page_documents(page_docs, max_chars=max_chars_per_page)
+                selected_chunk_ids = []
+            if not content:
+                continue
+            all_chunk_ids = {
+                int(doc.metadata["chunk_id"])
+                for doc in page_docs
+                if doc.metadata.get("chunk_id") is not None
+            }
+            pages.append(
+                RetrievedPage(
+                    filename=group["filename"],
+                    page_number=group["page_number"],
+                    score=round(float(group.get("final_score", group["best_score"])), 6),
+                    hit_count=group["hit_count"],
+                    chunk_ids=sorted(selected_chunk_ids or all_chunk_ids or group["chunk_ids"]),
+                    content=content,
+                )
+            )
+
+        # Safety fallback: if segment-filtered retrieval yields nothing,
+        # fall back to flat retrieval so we never return empty for a valid
+        # query.
+        if not pages:
+            route_info["fallback_to_flat"] = True
+            pages = self.base.retrieve_pages(
+                query,
+                initial_k=initial_k,
+                final_pages=final_pages,
+                score_threshold=score_threshold,
+                max_chars_per_page=max_chars_per_page,
+            )
+
+        return pages, route_info
+
+    def answer_structured_hierarchical(
+        self,
+        query: str,
+        filename: str | None = None,
+        initial_k: int = 80,
+        final_pages: int = 5,
+        max_chars_per_page: int = 5000,
+        run_llm: bool = True,
+        include_prompt: bool = False,
+    ) -> dict:
+        pages, route_info = self.retrieve_pages_hierarchical(
+            query,
+            filename=filename,
+            initial_k=initial_k,
+            final_pages=final_pages,
+            max_chars_per_page=max_chars_per_page,
+        )
+
+        if not pages:
+            result = {
+                "filename": "",
+                "page": -1,
+                "answer": "未检索到相关片段",
+                "sources": [],
+                "llm_used": False,
+                "raw_answer": "",
+                "error": "no_retrieval_hits",
+                **({"prompt": ""} if include_prompt else {}),
+            }
+            result["route_info"] = route_info
+            return result
+
+        prompt = self.base.build_prompt(query, pages)
+        sources = self.base._format_sources(pages)
+        fallback = StructuredAnswer(
+            filename=pages[0].filename,
+            page=pages[0].page_number,
+            answer="",
+            sources=sources,
+            prompt=prompt,
+            llm_used=False,
+        )
+
+        if not run_llm:
+            fallback.error = "llm_not_run"
+            result = fallback.to_dict(include_prompt=include_prompt)
+            result["route_info"] = route_info
+            return result
+
+        if not self.base.llm.available:
+            fallback.error = "llm_unavailable: OPENAI_API_KEY is empty"
+            result = fallback.to_dict(include_prompt=include_prompt)
+            result["route_info"] = route_info
+            return result
+
+        try:
+            raw_answer = self.base.llm.generate(prompt)
+        except Exception as exc:
+            fallback.error = f"llm_exception: {exc}"
+            result = fallback.to_dict(include_prompt=include_prompt)
+            result["route_info"] = route_info
+            return result
+
+        parsed = self.base.parse_structured_answer(raw_answer)
+        if not parsed:
+            fallback.answer = raw_answer.strip()
+            fallback.raw_answer = raw_answer
+            fallback.llm_used = True
+            fallback.error = "llm_output_not_json"
+            result = fallback.to_dict(include_prompt=include_prompt)
+            result["route_info"] = route_info
+            return result
+
+        filename_out = parsed.get("filename") or pages[0].filename
+        page = self.base._normalize_page_value(parsed.get("page") or pages[0].page_number)
+        valid_sources = {(source["filename"], str(source["page"])) for source in sources}
+        if (filename_out, str(page)) not in valid_sources:
+            filename_out = pages[0].filename
+            page = pages[0].page_number
+        else:
+            filename_out, page = self.base._maybe_override_source(filename_out, page, sources)
+        answer = parsed.get("answer") or ""
+
+        result = StructuredAnswer(
+            filename=filename_out,
+            page=page,
+            answer=answer,
+            sources=sources,
+            prompt=prompt,
+            raw_answer=raw_answer,
+            llm_used=True,
+        ).to_dict(include_prompt=include_prompt)
+        result["route_info"] = route_info
+        return result

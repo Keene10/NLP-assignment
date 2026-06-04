@@ -1,0 +1,33 @@
+# 核心依赖
+langchain
+langchain-openai
+langchain-community
+langchain-chroma
+
+# 文档处理
+pypdf
+pdfplumber
+PyMuPDF
+rapidocr-onnxruntime
+python-docx
+markdown
+beautifulsoup4
+
+# 向量模型
+sentence-transformers
+
+# 数据库
+chromadb
+faiss-cpu
+
+# Web框架
+fastapi
+uvicorn
+streamlit
+
+# 工具
+python-dotenv
+rich
+
+# 测试
+pytest

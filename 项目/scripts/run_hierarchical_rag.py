@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -48,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0, help="0 means all remaining")
     parser.add_argument("--skip-evaluate", action="store_true")
     parser.add_argument("--skip-hierarchical", action="store_true", help="Run flat RAG as baseline instead")
+    parser.add_argument(
+        "--force-retrieved-page",
+        action="store_true",
+        help="Use the top retrieved page as filename/page and let the LLM generate only the answer.",
+    )
     parser.add_argument("--run-llm", action="store_true", default=True, help="Generate answers with LLM")
     parser.add_argument("--no-run-llm", action="store_false", dest="run_llm", help="Skip LLM answer generation (retrieval only)")
     return parser.parse_args()
@@ -145,7 +151,6 @@ def evaluate(predictions: list[dict], ground_truth: list[dict]) -> dict:
 
 
 def main() -> None:
-    import re  # noqa: F811 – imported above but used inside evaluate; keep here for closure
     args = parse_args()
 
     questions = load_json(args.questions_file)
@@ -176,7 +181,46 @@ def main() -> None:
         filename = item.get("filename")
 
         try:
-            if args.skip_hierarchical:
+            if args.force_retrieved_page:
+                if args.skip_hierarchical:
+                    pages = rag.retrieve_pages(
+                        question,
+                        initial_k=args.initial_k,
+                        final_pages=args.final_pages,
+                        max_chars_per_page=args.max_chars_per_page,
+                    )
+                    route_info = None
+                else:
+                    pages, route_info = rag.retrieve_pages_hierarchical(
+                        question,
+                        filename=filename,
+                        initial_k=args.initial_k,
+                        final_pages=args.final_pages,
+                        max_chars_per_page=args.max_chars_per_page,
+                    )
+                if not pages:
+                    result = {
+                        "filename": filename or "",
+                        "page": -1,
+                        "answer": "",
+                        "sources": [],
+                        "llm_used": False,
+                        "raw_answer": "",
+                        "error": "no_retrieval_hits",
+                    }
+                else:
+                    top_page = pages[0]
+                    answer_rag = rag if args.skip_hierarchical else rag.base
+                    result = answer_rag.answer_forced_page(
+                        query=question,
+                        filename=top_page.filename,
+                        page=top_page.page_number,
+                        neighbor_pages=1,
+                        run_llm=args.run_llm,
+                        force_page=True,
+                    )
+                    result["route_info"] = route_info
+            elif args.skip_hierarchical:
                 result = rag.answer_structured(
                     question,
                     initial_k=args.initial_k,

@@ -269,14 +269,13 @@ class SegmentRouter:
             return segments[0]
 
         if not self.llm.available:
-            # Fallback: return the first segment (largest coverage)
-            return segments[0]
+            return None
 
         prompt = build_segment_prompt(query, segments)
         try:
             raw = self.llm.generate(prompt)
         except Exception:
-            return segments[0]
+            return None
 
         segment_id = parse_segment_id(raw)
         if segment_id:
@@ -284,5 +283,4 @@ class SegmentRouter:
                 if seg.segment_id == segment_id:
                     return seg
 
-        # Fallback
-        return segments[0]
+        return None

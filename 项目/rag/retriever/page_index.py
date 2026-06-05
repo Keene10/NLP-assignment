@@ -19,13 +19,31 @@ class PageCandidate:
     bonus_score: float
 
 
+@dataclass
+class SectionProfile:
+    filename: str
+    title: str
+    start_page: int
+    end_page: int
+    profile_text: str
+
+
 class PageTextIndex:
+    WEAK_QUERY_TERMS = (
+        "如何",
+        "分析",
+        "评估",
+        "评价",
+        "看待",
+    )
+
     def __init__(self, chunks_path: str | Path):
         self.chunks_path = Path(chunks_path)
         self.pages: dict[tuple[str, int], list[Document]] = {}
         self.page_texts: dict[tuple[str, int], str] = {}
         self.page_tokens: dict[tuple[str, int], Counter] = {}
         self.page_lengths: dict[tuple[str, int], int] = {}
+        self.section_profiles: dict[str, list[SectionProfile]] = {}
         self.idf: dict[str, float] = {}
         self.avg_doc_length = 1.0
         self._load()
@@ -55,6 +73,7 @@ class PageTextIndex:
             self.page_texts[key] = "\n".join(doc.page_content for doc in documents)
 
         self._build_bm25()
+        self._build_section_profiles()
 
     def _build_bm25(self) -> None:
         document_frequency: Counter[str] = Counter()
@@ -88,11 +107,19 @@ class PageTextIndex:
                     tokens.extend(
                         sequence[index : index + ngram_size]
                         for index in range(len(sequence) - ngram_size + 1)
-                    )
+                        )
         return tokens
 
+    @classmethod
+    def query_text_for_keyword(cls, query: str) -> str:
+        normalized = cls.normalize_text(query)
+        filtered = normalized
+        for term in cls.WEAK_QUERY_TERMS:
+            filtered = filtered.replace(cls.normalize_text(term), " ")
+        return filtered if len(cls.tokenize(filtered)) >= 2 else normalized
+
     def keyword_score(self, query: str, key: tuple[str, int]) -> float:
-        query_tokens = Counter(self.tokenize(query))
+        query_tokens = Counter(self.tokenize(self.query_text_for_keyword(query)))
         page_tokens = self.page_tokens.get(key, Counter())
         doc_length = self.page_lengths.get(key, 1) or 1
         score = 0.0
@@ -253,6 +280,212 @@ class PageTextIndex:
             if term.lower() in query.lower():
                 terms.add(self.normalize_text(term))
         return {term for term in terms if len(term) >= 2}
+
+    def _build_section_profiles(self) -> None:
+        self.section_profiles = {}
+        files = sorted({filename for filename, _ in self.page_texts})
+        for filename in files:
+            pages = sorted(page for file_name, page in self.page_texts if file_name == filename)
+            if not pages:
+                continue
+            starts = self._extract_toc_sections(filename, pages)
+            if len(starts) < 2:
+                starts = self._extract_heading_sections(filename, pages)
+            if not starts:
+                starts = [(pages[0], "全文")]
+
+            merged_by_page: dict[int, list[str]] = {}
+            page_set = set(pages)
+            for page_number, title in starts:
+                if page_number not in page_set or not title:
+                    continue
+                title = self._clean_section_title(title)
+                if not title:
+                    continue
+                merged_by_page.setdefault(page_number, [])
+                if title not in merged_by_page[page_number]:
+                    merged_by_page[page_number].append(title)
+
+            distinct_starts = sorted(merged_by_page)
+            profiles: list[SectionProfile] = []
+            for index, start_page in enumerate(distinct_starts):
+                next_start = distinct_starts[index + 1] if index + 1 < len(distinct_starts) else pages[-1] + 1
+                end_page = max(start_page, min(next_start - 1, pages[-1]))
+                title = "；".join(merged_by_page[start_page][:3])
+                profile_text = self._build_section_profile_text(filename, title, start_page, end_page)
+                if profile_text:
+                    profiles.append(
+                        SectionProfile(
+                            filename=filename,
+                            title=title,
+                            start_page=start_page,
+                            end_page=end_page,
+                            profile_text=profile_text,
+                        )
+                    )
+            self.section_profiles[filename] = profiles
+
+    def _extract_toc_sections(self, filename: str, pages: list[int]) -> list[tuple[int, str]]:
+        starts: list[tuple[int, str]] = []
+        toc_pages = pages[: min(12, len(pages))]
+        for page_number in toc_pages:
+            text = self.page_texts.get((filename, page_number), "")
+            for line in self._clean_lines(text):
+                if self._is_noise_heading(line) or line.startswith(("图表", "图 ", "图")):
+                    continue
+                parsed = self._parse_toc_line(line)
+                if parsed is not None:
+                    starts.append(parsed)
+        return self._deduplicate_section_starts(starts)
+
+    def _extract_heading_sections(self, filename: str, pages: list[int]) -> list[tuple[int, str]]:
+        starts: list[tuple[int, str]] = []
+        for page_number in pages:
+            text = self.page_texts.get((filename, page_number), "")
+            for line in self._clean_lines(text)[:12]:
+                if self._is_noise_heading(line):
+                    continue
+                if self._looks_like_section_heading(line):
+                    starts.append((page_number, line))
+                    break
+        return self._deduplicate_section_starts(starts)
+
+    @classmethod
+    def _parse_toc_line(cls, line: str) -> tuple[int, str] | None:
+        text = line.strip()
+        patterns = (
+            r"^(.{2,90}?)(?:\.{2,}|…{2,}|·{2,}|\s{2,})\s*-?\s*(\d{1,3})\s*-?\s*$",
+            r"^(.{2,90}?)\s+-\s*(\d{1,3})\s*-\s*$",
+        )
+        for pattern in patterns:
+            match = re.match(pattern, text)
+            if not match:
+                continue
+            title, page = match.group(1).strip(), int(match.group(2))
+            if cls._looks_like_section_heading(title) or cls._looks_like_plain_toc_title(title):
+                return page, title
+        return None
+
+    @staticmethod
+    def _looks_like_plain_toc_title(line: str) -> bool:
+        if len(line) < 4 or len(line) > 80:
+            return False
+        if line.startswith(("目录", "内容目录", "正文目录", "图表目录", "资料来源", "免责声明")):
+            return False
+        return bool(re.search(r"[\u4e00-\u9fff]{3,}", line))
+
+    @staticmethod
+    def _looks_like_section_heading(line: str) -> bool:
+        text = line.strip()
+        if len(text) < 4 or len(text) > 100:
+            return False
+        if text.startswith(("图表", "图 ", "表 ", "资料来源", "免责声明", "请务必阅读")):
+            return False
+        return bool(
+            re.match(r"^[一二三四五六七八九十]{1,3}[、.．]\s*\S+", text)
+            or re.match(r"^\d+(?:\.\d+){0,3}\.?\s*\S+", text)
+        )
+
+    @classmethod
+    def _deduplicate_section_starts(cls, starts: list[tuple[int, str]]) -> list[tuple[int, str]]:
+        seen: set[tuple[int, str]] = set()
+        cleaned: list[tuple[int, str]] = []
+        for page, title in starts:
+            title = cls._clean_section_title(title)
+            if page <= 0 or not title:
+                continue
+            key = (page, title)
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(key)
+        cleaned.sort(key=lambda item: (item[0], item[1]))
+        return cleaned
+
+    @staticmethod
+    def _clean_section_title(title: str) -> str:
+        text = re.sub(r"\s+", " ", str(title or "")).strip(" .。·…-")
+        text = re.sub(r"^目录\s*", "", text).strip()
+        return text[:120]
+
+    @staticmethod
+    def _is_noise_heading(line: str) -> bool:
+        return bool(
+            not line
+            or line.startswith(("请务必阅读", "免责声明", "证券研究报告", "公司深度报告", "资料来源", "注："))
+            or line in {"目 录", "目录", "正文目录", "内容目录", "图表目录", "CONTENTS"}
+        )
+
+    @classmethod
+    def _clean_lines(cls, text: str) -> list[str]:
+        return [
+            re.sub(r"\s+", " ", line).strip()
+            for line in str(text or "").splitlines()
+            if re.sub(r"\s+", " ", line).strip()
+        ]
+
+    def _build_section_profile_text(
+        self,
+        filename: str,
+        title: str,
+        start_page: int,
+        end_page: int,
+    ) -> str:
+        pieces: list[str] = [title]
+        for page_number in range(start_page, end_page + 1):
+            text = self.page_texts.get((filename, page_number), "")
+            if not text:
+                continue
+            lines = self._clean_lines(text)
+            selected_lines: list[str] = []
+            for line in lines[:30]:
+                if self._is_noise_heading(line):
+                    continue
+                if (
+                    self._looks_like_section_heading(line)
+                    or re.match(r"^(?:图表|图|表)\s*\d{1,3}\s*[:：]", line)
+                    or ("：" in line and len(line) <= 80)
+                ):
+                    selected_lines.append(line)
+                if len(selected_lines) >= 5:
+                    break
+            body = " ".join(
+                line
+                for line in lines
+                if not self._is_noise_heading(line) and not line.startswith(("图表目录", "图表 "))
+            )
+            if body:
+                selected_lines.append(body[:220])
+            pieces.extend(selected_lines[:6])
+            if sum(len(piece) for piece in pieces) > 3000:
+                break
+        profile = "\n".join(piece for piece in pieces if piece)
+        return profile[:3500]
+
+    def section_keyword_score(self, query: str, section: SectionProfile) -> float:
+        query_tokens = Counter(self.tokenize(self.query_text_for_keyword(query)))
+        section_tokens = Counter(self.tokenize(section.profile_text))
+        if not query_tokens or not section_tokens:
+            return 0.0
+        doc_length = sum(section_tokens.values()) or 1
+        score = 0.0
+        k1 = 1.5
+        b = 0.75
+        for token in query_tokens:
+            frequency = section_tokens.get(token, 0)
+            if not frequency:
+                continue
+            denominator = frequency + k1 * (1 - b + b * doc_length / self.avg_doc_length)
+            score += self.idf.get(token, 0.0) * frequency * (k1 + 1) / denominator
+        return score
+
+    def section_entity_overlap(self, query: str, section: SectionProfile) -> float:
+        terms = self.important_terms(query)
+        if not terms:
+            return 0.0
+        profile_text = self.normalize_text(section.profile_text)
+        hits = sum(1 for term in terms if term in profile_text)
+        return hits / max(len(terms), 1)
 
     def rank(self, query: str, top_k: int = 30) -> list[PageCandidate]:
         candidates: list[PageCandidate] = []

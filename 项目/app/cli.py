@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -15,8 +16,22 @@ if hasattr(sys.stdout, "reconfigure"):
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+os.chdir(ROOT_DIR)
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-from config.config import OPENAI_API_KEY, RETRIEVAL_CHUNKS_PATH
+from config.config import (
+    OPENAI_API_KEY,
+    PAGE_RERANKER_BATCH_SIZE,
+    PAGE_RERANKER_CANDIDATES,
+    PAGE_RERANKER_MAX_CHARS,
+    PAGE_RERANKER_NEIGHBOR_PAGES,
+    PAGE_RERANKER_MODEL,
+    PAGE_RERANKER_WEIGHT,
+    RETRIEVAL_CHUNKS_PATH,
+    VECTOR_DB_PATH,
+)
+from rag.retriever.evaluate import evaluate as evaluate_with_ppt_metrics
 from rag.retriever.page_selector import select_evidence_pages
 from rag.retriever.rag import RAGService
 from rag.vector.vector_db import VectorDB
@@ -29,8 +44,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--questions-file", default="财报数据库/test.json")
     parser.add_argument("--ground-truth", default="财报数据库/test_ground_truth.json")
     parser.add_argument("--backend", default="simple", choices=["auto", "chroma", "simple"])
-    parser.add_argument("--vector-db-path", default="outputs/vector_db")
+    parser.add_argument("--vector-db-path", default=VECTOR_DB_PATH)
     parser.add_argument("--base-page-plan", default="outputs/optimized_page_plan.json")
+    parser.add_argument("--use-page-plan-file", action="store_true")
     parser.add_argument("--selected-page-plan", default="outputs/llm_selected_page_plan.json")
     parser.add_argument("--page-selector-debug", default="outputs/llm_selected_page_plan_debug.json")
     parser.add_argument("--debug-output", default="outputs/final_debug.json")
@@ -38,17 +54,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunks", default=RETRIEVAL_CHUNKS_PATH)
     parser.add_argument("--initial-k", type=int, default=200)
     parser.add_argument("--base-retrieval-pages", type=int, default=50)
+    parser.add_argument("--reranker-model", default=PAGE_RERANKER_MODEL)
+    parser.add_argument("--reranker-candidates", type=int, default=PAGE_RERANKER_CANDIDATES)
+    parser.add_argument("--reranker-batch-size", type=int, default=PAGE_RERANKER_BATCH_SIZE)
+    parser.add_argument("--reranker-max-chars", type=int, default=PAGE_RERANKER_MAX_CHARS)
+    parser.add_argument("--reranker-weight", type=float, default=PAGE_RERANKER_WEIGHT)
+    parser.add_argument("--reranker-neighbor-pages", type=int, default=PAGE_RERANKER_NEIGHBOR_PAGES)
+    parser.add_argument(
+        "--reranker-query-mode",
+        default="original",
+        choices=["original", "keywords", "original_keywords"],
+    )
+    parser.add_argument("--disable-reranker", action="store_true")
+    parser.add_argument("--disable-targeted-retrieval", action="store_true")
+    parser.add_argument("--allow-reranker-cross-file", action="store_true")
     parser.add_argument("--neighbor-pages", type=int, default=4)
+    parser.add_argument("--page-selector-top-k", type=int, default=5)
+    parser.add_argument("--page-selector-vector-k", type=int, default=80)
+    parser.add_argument("--page-selector-keyword-k", type=int, default=80)
     parser.add_argument("--page-selector-neighbor-pages", type=int, default=4)
     parser.add_argument("--page-selector-max-chars", type=int, default=1500)
-    parser.add_argument("--max-chars-per-page", type=int, default=1800)
+    parser.add_argument("--retrieval-max-chars-per-page", type=int, default=1800)
+    parser.add_argument("--max-chars-per-page", type=int, default=2400)
+    parser.add_argument("--answer-context-mode", default="topk", choices=["topk", "selected"])
+    parser.add_argument("--answer-max-pages", type=int, default=10)
     parser.add_argument("--progress-every", type=int, default=5)
     parser.add_argument("--sleep-seconds", type=float, default=0)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 means all remaining questions.")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--skip-page-selector", action="store_true")
+    parser.add_argument(
+        "--skip-page-selector",
+        action="store_true",
+        default=True,
+        help="Default: use local retrieval/reranker page plan directly; do not call API to select page.",
+    )
+    parser.add_argument(
+        "--use-api-page-selector",
+        dest="skip_page_selector",
+        action="store_false",
+        help="Optional ablation: call API to choose final page from local candidates.",
+    )
     parser.add_argument("--use-existing-selected-page-plan", action="store_true")
+    parser.add_argument("--evaluate-page-only", action="store_true")
+    parser.add_argument("--page-evaluation-output", default="outputs/page_plan_evaluation.json")
     parser.add_argument("--skip-evaluate", action="store_true")
     return parser.parse_args()
 
@@ -82,10 +131,14 @@ def load_page_plan(path: str | Path) -> dict[int, dict]:
     plan = {}
     for position, item in enumerate(data):
         index = int(item.get("index", position))
-        plan[index] = {
+        plan_item = {
             "filename": item["filename"],
             "page": int(item["page"]),
         }
+        for field in ("confidence", "reason", "answer_pages"):
+            if field in item:
+                plan_item[field] = item[field]
+        plan[index] = plan_item
     return plan
 
 
@@ -150,10 +203,12 @@ def fill_questions_file(
 
 def build_base_page_plan(args: argparse.Namespace, questions: list[dict]) -> dict[int, dict]:
     plan_path = ROOT_DIR / args.base_page_plan
-    if plan_path.exists():
+    if args.use_page_plan_file:
+        if not plan_path.exists():
+            raise FileNotFoundError(f"page plan file not found: {plan_path}")
         return load_page_plan(plan_path)
 
-    print("未找到基础页码计划，开始用本地检索生成，不调用 API。")
+    print("开始用本地检索生成临时页码计划，不调用 API，不使用预存页码顺序计划。")
     rag = RAGService(
         vector_db=VectorDB(
             persist_directory=args.vector_db_path,
@@ -168,7 +223,16 @@ def build_base_page_plan(args: argparse.Namespace, questions: list[dict]) -> dic
             item["question"],
             initial_k=args.initial_k,
             final_pages=args.base_retrieval_pages,
-            max_chars_per_page=args.max_chars_per_page,
+            max_chars_per_page=args.retrieval_max_chars_per_page,
+            reranker_model="" if args.disable_reranker else args.reranker_model,
+            reranker_candidates=args.reranker_candidates,
+            reranker_batch_size=args.reranker_batch_size,
+            reranker_max_chars=args.reranker_max_chars,
+            reranker_weight=args.reranker_weight,
+            restrict_reranker_to_top_file=not args.allow_reranker_cross_file,
+            reranker_query_mode=args.reranker_query_mode,
+            reranker_neighbor_pages=args.reranker_neighbor_pages,
+            targeted_retrieval=not args.disable_targeted_retrieval,
         )
         if not pages:
             raise RuntimeError(f"local retrieval found no page for question {index}")
@@ -177,14 +241,53 @@ def build_base_page_plan(args: argparse.Namespace, questions: list[dict]) -> dic
                 "index": index,
                 "filename": pages[0].filename,
                 "page": normalize_page(pages[0].page_number),
+                "answer_pages": [
+                    {
+                        "filename": page.filename,
+                        "page": normalize_page(page.page_number),
+                        "chunk_ids": page.chunk_ids,
+                        "fusion_score": page.score,
+                    }
+                    for page in pages[: max(1, args.answer_max_pages)]
+                ],
             }
         )
         if args.progress_every > 0 and (
             offset == 1 or offset == len(selected) or offset % args.progress_every == 0
         ):
             print(f"base page planned {offset}/{len(selected)} index={index}")
-    write_json(plan_path, plan_items)
-    return load_page_plan(plan_path)
+    return {int(item["index"]): item for item in plan_items}
+
+
+def evaluate_page_plan(args: argparse.Namespace, questions: list[dict], page_plan: dict[int, dict]) -> dict:
+    end_index = len(questions) if args.limit <= 0 else min(len(questions), args.start_index + args.limit)
+    selected_indices = list(range(args.start_index, end_index))
+    predictions = []
+    for index in selected_indices:
+        item = questions[index]
+        planned = page_plan.get(index, {})
+        predictions.append(
+            {
+                "question": item.get("question", ""),
+                "filename": planned.get("filename", ""),
+                "page": normalize_page(planned.get("page", -1)),
+                "answer": "",
+            }
+        )
+    if not (ROOT_DIR / args.ground_truth).exists():
+        result = {
+            "summary": {
+                "total": len(predictions),
+                "note": "ground truth file not found; page accuracy was not computed",
+            },
+            "predictions": predictions,
+        }
+    else:
+        ground_truth = load_json(args.ground_truth)
+        selected_truth = [ground_truth[index] for index in selected_indices]
+        result = evaluate_with_ppt_metrics(predictions, selected_truth)
+    write_json(args.page_evaluation_output, result)
+    return result
 
 
 def run_page_selection(args: argparse.Namespace, questions: list[dict], base_plan: dict[int, dict]) -> dict[int, dict]:
@@ -196,6 +299,11 @@ def run_page_selection(args: argparse.Namespace, questions: list[dict], base_pla
         questions=questions,
         base_plan=base_plan,
         chunks_path=args.chunks,
+        vector_db_path=args.vector_db_path,
+        vector_backend=args.backend,
+        fusion_top_k=args.page_selector_top_k,
+        vector_top_k=args.page_selector_vector_k,
+        keyword_top_k=args.page_selector_keyword_k,
         radius=args.page_selector_neighbor_pages,
         max_chars_per_page=args.page_selector_max_chars,
         start_index=args.start_index,
@@ -232,16 +340,30 @@ def run_generation(args: argparse.Namespace, questions: list[dict], page_plan: d
             raise RuntimeError(f"missing page plan for question {index}")
 
         try:
-            result = rag.answer_forced_page(
-                item["question"],
-                filename=planned["filename"],
-                page=planned["page"],
-                neighbor_pages=args.neighbor_pages,
-                max_chars_per_page=args.max_chars_per_page,
-                run_llm=True,
-                include_prompt=False,
-                force_page=force_page,
-            )
+            answer_pages = list(planned.get("answer_pages") or [])[: max(1, args.answer_max_pages)]
+            if args.answer_context_mode == "topk" and force_page and answer_pages:
+                result = rag.answer_forced_candidates(
+                    item["question"],
+                    filename=planned["filename"],
+                    page=planned["page"],
+                    candidate_pages=answer_pages,
+                    neighbor_pages=args.neighbor_pages,
+                    max_chars_per_page=args.max_chars_per_page,
+                    run_llm=True,
+                    include_prompt=False,
+                    force_page=force_page,
+                )
+            else:
+                result = rag.answer_forced_page(
+                    item["question"],
+                    filename=planned["filename"],
+                    page=planned["page"],
+                    neighbor_pages=args.neighbor_pages,
+                    max_chars_per_page=args.max_chars_per_page,
+                    run_llm=True,
+                    include_prompt=False,
+                    force_page=force_page,
+                )
         except Exception as exc:
             result = {
                 "filename": planned["filename"],
@@ -355,19 +477,25 @@ def main() -> None:
     questions = load_questions(args.questions_file)
     base_plan = build_base_page_plan(args, questions)
 
-    if args.skip_page_selector:
-        active_plan = base_plan
-        force_page = False
-    else:
+    if args.evaluate_page_only:
+        result = evaluate_page_plan(args, questions, base_plan)
+        print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
+        return
+
+    if not args.skip_page_selector:
         print("开始 API 页码选择阶段：只选证据页，不生成答案。")
         active_plan = run_page_selection(args, questions, base_plan)
+        force_page = True
+    else:
+        print("使用本地检索页码计划作为最终 page，不调用 API 选页。")
+        active_plan = base_plan
         force_page = True
 
     print("开始 API 答案生成，并把结果直接填入 test.json。")
     result = run_generation(args, questions, active_plan, force_page=force_page)
 
     if not args.skip_evaluate and (ROOT_DIR / args.ground_truth).exists():
-        evaluation = evaluate_predictions(load_questions(args.questions_file), load_json(args.ground_truth))
+        evaluation = evaluate_with_ppt_metrics(load_questions(args.questions_file), load_json(args.ground_truth))
         write_json(args.evaluation_output, evaluation)
         result["evaluation_output"] = str((ROOT_DIR / args.evaluation_output).resolve())
         result.update(evaluation["summary"])

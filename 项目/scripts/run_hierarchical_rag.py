@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run Hierarchical RAG on test.json and produce predictions + evaluation.
+"""Run Hierarchical RAG on the updated test set and produce predictions + evaluation.
 
 Usage:
     python scripts/run_hierarchical_rag.py \
-        --questions-file 财报数据库/test.json \
-        --ground-truth 财报数据库/test_ground_truth.json \
-        --output outputs/hierarchical_rag.json \
+        --questions-file 财报数据库/test_new.json \
+        --ground-truth 财报数据库/test_new_ground_truth.json \
+        --output outputs/hierarchical_rag_new.json \
         --backend simple \
         --vector-db-path outputs/vector_db \
         --initial-k 80 \
@@ -34,10 +34,10 @@ from rag.vector.vector_db import VectorDB
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hierarchical RAG pipeline")
-    parser.add_argument("--questions-file", default="财报数据库/test.json")
-    parser.add_argument("--ground-truth", default="财报数据库/test_ground_truth.json")
-    parser.add_argument("--output", default="outputs/hierarchical_rag.json")
-    parser.add_argument("--debug-output", default="outputs/hierarchical_rag_debug.json")
+    parser.add_argument("--questions-file", default="财报数据库/test_new.json")
+    parser.add_argument("--ground-truth", default="财报数据库/test_new_ground_truth.json")
+    parser.add_argument("--output", default="outputs/hierarchical_rag_new.json")
+    parser.add_argument("--debug-output", default="outputs/hierarchical_rag_debug_new.json")
     parser.add_argument("--backend", default="simple", choices=["auto", "chroma", "simple"])
     parser.add_argument("--vector-db-path", default="outputs/vector_db")
     parser.add_argument("--initial-k", type=int, default=80)

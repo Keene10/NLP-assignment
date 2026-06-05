@@ -24,17 +24,17 @@ from rag.vector.vector_db import VectorDB
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Final financial-report RAG pipeline. Results are filled into test.json."
+        description="Final financial-report RAG pipeline. Results are filled into the selected test JSON."
     )
-    parser.add_argument("--questions-file", default="财报数据库/test.json")
-    parser.add_argument("--ground-truth", default="财报数据库/test_ground_truth.json")
+    parser.add_argument("--questions-file", default="财报数据库/test_new.json")
+    parser.add_argument("--ground-truth", default="财报数据库/test_new_ground_truth.json")
     parser.add_argument("--backend", default="simple", choices=["auto", "chroma", "simple"])
     parser.add_argument("--vector-db-path", default="outputs/vector_db")
-    parser.add_argument("--base-page-plan", default="outputs/optimized_page_plan.json")
-    parser.add_argument("--selected-page-plan", default="outputs/llm_selected_page_plan.json")
-    parser.add_argument("--page-selector-debug", default="outputs/llm_selected_page_plan_debug.json")
-    parser.add_argument("--debug-output", default="outputs/final_debug.json")
-    parser.add_argument("--evaluation-output", default="outputs/final_evaluation.json")
+    parser.add_argument("--base-page-plan", default="outputs/optimized_page_plan_new.json")
+    parser.add_argument("--selected-page-plan", default="outputs/llm_selected_page_plan_new.json")
+    parser.add_argument("--page-selector-debug", default="outputs/llm_selected_page_plan_debug_new.json")
+    parser.add_argument("--debug-output", default="outputs/final_debug_new.json")
+    parser.add_argument("--evaluation-output", default="outputs/final_evaluation_new.json")
     parser.add_argument("--chunks", default=RETRIEVAL_CHUNKS_PATH)
     parser.add_argument("--initial-k", type=int, default=200)
     parser.add_argument("--base-retrieval-pages", type=int, default=50)

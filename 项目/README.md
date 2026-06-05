@@ -40,12 +40,12 @@ python app/cli.py
 
 程序会按顺序执行：
 
-1. 读取 `财报数据库/test.json` 中的问题。
+1. 默认读取新版 `财报数据库/test_new.json` 中的问题。
 2. 使用本地 OCR 增强文本和向量库获得基础候选页。
 3. 调用同一个 API 模型做"证据页选择"，只选页码，不生成答案。
 4. 在选中页及相邻页上下文中生成答案。
-5. 将 `filename`、`page`、`answer` 直接填回 `财报数据库/test.json`，保留原有 `question` 和 JSON 数组结构。
-6. 如果存在 `财报数据库/test_ground_truth.json`，会在本地生成最新评测 `outputs/final_evaluation.json`。
+5. 将 `filename`、`page`、`answer` 直接填回 `财报数据库/test_new.json`，保留原有 `question` 和 JSON 数组结构。
+6. 如果存在 `财报数据库/test_new_ground_truth.json`，会在本地生成最新评测 `outputs/final_evaluation_new.json`。
 
 常用参数：
 
@@ -60,17 +60,22 @@ python app/cli.py --use-existing-selected-page-plan
 - `财报数据库/test_new.json`：新版问题文件，`filename`、`page`、`answer` 留空用于填写预测结果。
 - `财报数据库/test_new_ground_truth.json`：新版标准答案，用于本地评测。
 
-运行新版 67 题时请显式指定文件，避免默认跑到旧版 104 题：
+当前默认已经切到新版 67 题。旧版 104 题仍保留为历史对比文件：
+
+- `财报数据库/test.json`
+- `财报数据库/test_ground_truth.json`
+
+如需临时复跑旧版 104 题，请显式指定旧文件和旧输出：
 
 ```bash
 python app/cli.py \
-  --questions-file 财报数据库/test_new.json \
-  --ground-truth 财报数据库/test_new_ground_truth.json \
-  --base-page-plan outputs/optimized_page_plan_new.json \
-  --selected-page-plan outputs/llm_selected_page_plan_new.json \
-  --page-selector-debug outputs/llm_selected_page_plan_debug_new.json \
-  --debug-output outputs/final_debug_new.json \
-  --evaluation-output outputs/final_evaluation_new.json
+  --questions-file 财报数据库/test.json \
+  --ground-truth 财报数据库/test_ground_truth.json \
+  --base-page-plan outputs/optimized_page_plan.json \
+  --selected-page-plan outputs/llm_selected_page_plan.json \
+  --page-selector-debug outputs/llm_selected_page_plan_debug.json \
+  --debug-output outputs/final_debug.json \
+  --evaluation-output outputs/final_evaluation.json
 ```
 
 ### 方式二：多模态图表描述增强（新增）

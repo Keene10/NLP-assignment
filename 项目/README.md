@@ -55,6 +55,24 @@ python app/cli.py --skip-page-selector
 python app/cli.py --use-existing-selected-page-plan
 ```
 
+新版助教数据集为 67 题，对应文件：
+
+- `财报数据库/test_new.json`：新版问题文件，`filename`、`page`、`answer` 留空用于填写预测结果。
+- `财报数据库/test_new_ground_truth.json`：新版标准答案，用于本地评测。
+
+运行新版 67 题时请显式指定文件，避免默认跑到旧版 104 题：
+
+```bash
+python app/cli.py \
+  --questions-file 财报数据库/test_new.json \
+  --ground-truth 财报数据库/test_new_ground_truth.json \
+  --base-page-plan outputs/optimized_page_plan_new.json \
+  --selected-page-plan outputs/llm_selected_page_plan_new.json \
+  --page-selector-debug outputs/llm_selected_page_plan_debug_new.json \
+  --debug-output outputs/final_debug_new.json \
+  --evaluation-output outputs/final_evaluation_new.json
+```
+
 ### 方式二：多模态图表描述增强（新增）
 
 针对 PDF 中的图表/表格页面，使用 Qwen3-VL 生成结构化描述，供 RAG 系统使用。

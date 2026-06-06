@@ -32,6 +32,7 @@ from config.config import (
     VECTOR_DB_PATH,
 )
 from rag.retriever.evaluate import evaluate as evaluate_with_ppt_metrics
+from rag.retriever.page_calibration import HybridPageExperiment
 from rag.retriever.page_selector import select_evidence_pages
 from rag.retriever.rag import RAGService
 from rag.vector.vector_db import VectorDB
@@ -41,12 +42,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Final financial-report RAG pipeline. Results are filled into test.json."
     )
-    parser.add_argument("--questions-file", default="财报数据库/test.json")
-    parser.add_argument("--ground-truth", default="财报数据库/test_ground_truth.json")
+    parser.add_argument("--questions-file", default="财报数据库/test_new.json")
+    parser.add_argument("--ground-truth", default="财报数据库/test/test_new_ground_truth.json")
     parser.add_argument("--backend", default="simple", choices=["auto", "chroma", "simple"])
     parser.add_argument("--vector-db-path", default=VECTOR_DB_PATH)
     parser.add_argument("--base-page-plan", default="outputs/optimized_page_plan.json")
     parser.add_argument("--use-page-plan-file", action="store_true")
+    parser.add_argument(
+        "--page-plan-mode",
+        default="calibrated",
+        choices=["calibrated", "legacy"],
+        help="calibrated uses hybrid + anchors + selective reranker; legacy uses the old retrieve_pages flow.",
+    )
     parser.add_argument("--selected-page-plan", default="outputs/llm_selected_page_plan.json")
     parser.add_argument("--page-selector-debug", default="outputs/llm_selected_page_plan_debug.json")
     parser.add_argument("--debug-output", default="outputs/final_debug.json")
@@ -215,25 +222,42 @@ def build_base_page_plan(args: argparse.Namespace, questions: list[dict]) -> dic
             backend=args.backend,
         )
     )
+    page_experiment = (
+        HybridPageExperiment(rag=rag, candidate_pages=args.base_retrieval_pages)
+        if args.page_plan_mode == "calibrated"
+        else None
+    )
     end_index = len(questions) if args.limit <= 0 else min(len(questions), args.start_index + args.limit)
     selected = list(enumerate(questions[args.start_index:end_index], start=args.start_index))
     plan_items = []
     for offset, (index, item) in enumerate(selected, start=1):
-        pages = rag.retrieve_pages(
-            item["question"],
-            initial_k=args.initial_k,
-            final_pages=args.base_retrieval_pages,
-            max_chars_per_page=args.retrieval_max_chars_per_page,
-            reranker_model="" if args.disable_reranker else args.reranker_model,
-            reranker_candidates=args.reranker_candidates,
-            reranker_batch_size=args.reranker_batch_size,
-            reranker_max_chars=args.reranker_max_chars,
-            reranker_weight=args.reranker_weight,
-            restrict_reranker_to_top_file=not args.allow_reranker_cross_file,
-            reranker_query_mode=args.reranker_query_mode,
-            reranker_neighbor_pages=args.reranker_neighbor_pages,
-            targeted_retrieval=not args.disable_targeted_retrieval,
-        )
+        page_plan_debug = {}
+        if page_experiment is not None and not args.disable_reranker and not args.disable_targeted_retrieval:
+            hybrid_candidates = page_experiment.retrieve_hybrid_candidates(
+                item["question"],
+                initial_k=args.initial_k,
+                max_chars_per_page=args.retrieval_max_chars_per_page,
+            )
+            stage_results = page_experiment.run_all_stages(item["question"], hybrid_candidates)
+            selected_stage = stage_results["F_advanced_guarded"]
+            pages = selected_stage.pages
+            page_plan_debug = selected_stage.debug
+        else:
+            pages = rag.retrieve_pages(
+                item["question"],
+                initial_k=args.initial_k,
+                final_pages=args.base_retrieval_pages,
+                max_chars_per_page=args.retrieval_max_chars_per_page,
+                reranker_model="" if args.disable_reranker else args.reranker_model,
+                reranker_candidates=args.reranker_candidates,
+                reranker_batch_size=args.reranker_batch_size,
+                reranker_max_chars=args.reranker_max_chars,
+                reranker_weight=args.reranker_weight,
+                restrict_reranker_to_top_file=not args.allow_reranker_cross_file,
+                reranker_query_mode=args.reranker_query_mode,
+                reranker_neighbor_pages=args.reranker_neighbor_pages,
+                targeted_retrieval=not args.disable_targeted_retrieval,
+            )
         if not pages:
             raise RuntimeError(f"local retrieval found no page for question {index}")
         plan_items.append(
@@ -241,6 +265,8 @@ def build_base_page_plan(args: argparse.Namespace, questions: list[dict]) -> dic
                 "index": index,
                 "filename": pages[0].filename,
                 "page": normalize_page(pages[0].page_number),
+                "page_plan_mode": args.page_plan_mode,
+                "page_plan_debug": page_plan_debug,
                 "answer_pages": [
                     {
                         "filename": page.filename,

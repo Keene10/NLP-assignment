@@ -16,6 +16,8 @@ beautifulsoup4
 # Embedding and reranking
 sentence-transformers
 FlagEmbedding
+transformers
+torch
 
 # Vector database
 chromadb

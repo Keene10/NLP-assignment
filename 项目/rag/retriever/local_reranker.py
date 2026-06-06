@@ -11,7 +11,7 @@ class RerankResult:
 
 
 class LocalPageReranker:
-    """Thin wrapper around a local sentence-transformers CrossEncoder reranker."""
+    """Thin wrapper around local CrossEncoder/FlagEmbedding/HF rerankers."""
 
     def __init__(
         self,
@@ -35,6 +35,10 @@ class LocalPageReranker:
             return self._model
         if not self.enabled:
             raise RuntimeError("reranker model is empty")
+        if self._prefer_hf_sequence():
+            return self._load_hf_sequence_reranker()
+        if self._prefer_flag_embedding():
+            return self._load_flag_reranker()
         try:
             from sentence_transformers import CrossEncoder
 
@@ -47,6 +51,9 @@ class LocalPageReranker:
             self.error = str(exc)
             first_error = exc
 
+        return self._load_flag_reranker(first_error if "first_error" in locals() else None)
+
+    def _load_flag_reranker(self, first_error: Exception | None = None):
         try:
             from FlagEmbedding import FlagReranker
 
@@ -54,8 +61,36 @@ class LocalPageReranker:
             self._backend = "flag_embedding"
             return self._model
         except Exception as exc:
-            self.error = f"{first_error}; {exc}" if "first_error" in locals() else str(exc)
+            self.error = f"{first_error}; {exc}" if first_error is not None else str(exc)
             raise
+
+    def _load_hf_sequence_reranker(self, first_error: Exception | None = None):
+        try:
+            import torch
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+            model = AutoModelForSequenceClassification.from_pretrained(
+                self.model_name,
+                trust_remote_code=True,
+            )
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model.to(device)
+            model.eval()
+            self._model = (tokenizer, model, device)
+            self._backend = "hf_sequence"
+            return self._model
+        except Exception as exc:
+            self.error = f"{first_error}; {exc}" if first_error is not None else str(exc)
+            raise
+
+    def _prefer_hf_sequence(self) -> bool:
+        model = self.model_name.lower()
+        return "bge-reranker-v2" in model
+
+    def _prefer_flag_embedding(self) -> bool:
+        model = self.model_name.lower()
+        return "bge-reranker-v2" in model or "flag" in model
 
     def rerank(self, query: str, passages: Iterable[str]) -> list[RerankResult]:
         passages = [self._trim_passage(passage) for passage in passages]
@@ -63,14 +98,47 @@ class LocalPageReranker:
             return []
         model = self._load_model()
         pairs = [(query, passage) for passage in passages]
-        if self._backend == "flag_embedding":
+        if self._backend == "hf_sequence":
+            scores = self._predict_hf_sequence(query, passages)
+        elif self._backend == "flag_embedding":
             scores = model.compute_score(pairs, batch_size=self.batch_size)
         else:
-            scores = model.predict(pairs, batch_size=self.batch_size)
+            try:
+                scores = model.predict(pairs, batch_size=self.batch_size)
+            except Exception as exc:
+                self._model = None
+                self.error = str(exc)
+                if self._prefer_hf_sequence():
+                    self._load_hf_sequence_reranker(exc)
+                    scores = self._predict_hf_sequence(query, passages)
+                else:
+                    model = self._load_flag_reranker(exc)
+                    scores = model.compute_score(pairs, batch_size=self.batch_size)
         return [
             RerankResult(index=index, score=float(score))
             for index, score in enumerate(scores)
         ]
+
+    def _predict_hf_sequence(self, query: str, passages: list[str]) -> list[float]:
+        import torch
+
+        tokenizer, model, device = self._model
+        scores: list[float] = []
+        for start in range(0, len(passages), self.batch_size):
+            batch = passages[start : start + self.batch_size]
+            encoded = tokenizer(
+                [query] * len(batch),
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(device) for key, value in encoded.items()}
+            with torch.no_grad():
+                logits = model(**encoded).logits.reshape(-1)
+            scores.extend(float(value) for value in logits.detach().cpu().tolist())
+        return scores
 
     def _trim_passage(self, passage: str) -> str:
         text = " ".join(str(passage or "").split())

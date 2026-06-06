@@ -45,14 +45,22 @@ python app/cli.py
 
 作用：
 
-- 读取 `财报数据库/test.json`。
-- 使用本地 hybrid retrieval 和 reranker 选择 page。
+- 读取 `财报数据库/test_new.json`。
+- 使用本地 `calibrated` page 计划选择 page：hybrid retrieval 为主，增强通用锚点校准、强锚点邻页校准和 guarded `bge-reranker-v2-m3` 作为辅助。
 - 调用 API 生成 answer。
-- 将结果填回 `财报数据库/test.json`。
+- 将结果填回 `财报数据库/test_new.json`。
+
+只做 page ablation：
+
+```bash
+python app/page_ablation.py
+```
+
+输出目录为 `outputs/page_ablation_test_new/`。
 
 ## 本地评测
 
-如果存在 `财报数据库/test_ground_truth.json`，运行主流程后会自动输出：
+如果存在 `财报数据库/test/test_new_ground_truth.json`，运行主流程后会自动输出：
 
 ```text
 outputs/final_evaluation.json

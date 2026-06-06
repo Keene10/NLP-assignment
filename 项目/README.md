@@ -4,7 +4,7 @@
 
 ## 目录结构
 
-- `app/cli.py`：最终一键运行入口，会把 `filename/page/answer` 直接填回 `财报数据库/test.json`。
+- `app/cli.py`：最终一键运行入口，会把 `filename/page/answer` 直接填回 `财报数据库/test_new.json`。
 - `app/streamlit_app.py`：原始 Streamlit Web 页面。
 - `config/config.py`：模型、路径、检索权重、reranker、Top-K 等配置。
 - `rag/document/`：PDF 加载、OCR/表格提取、文本切分、多模态图表说明合并。
@@ -22,15 +22,16 @@
 - 文本数据：`outputs/extracted_text_ocr_multimodal/chunks.jsonl`
 - 向量库：`outputs/vector_db_multimodal`
 
-page 选择不调用 API，流程为：
+page 选择不调用 API，默认使用 `calibrated` 本地页码计划：
 
 1. m3e embedding 向量检索。
 2. BM25 关键词检索。
 3. exact phrase、年份/数字/图表编号、业务词等规则加权。
 4. 图表直达页、图表目录页惩罚、自动章节语义路由。
-5. 候选页邻页扩展。
-6. `BAAI/bge-reranker-v2-m3` 本地重排序，取最终 page。
-7. 将 topK 页和多模态图表说明作为 answer 证据，调用 API 生成答案。
+5. hybrid topK 候选页进入通用锚点校准，锚点包括年份、季度、图表编号、数字单位、财务指标、英文数字实体、引号短语、实体短语和列表形态。
+6. 对细节型问题选择性降低前 1-3 页摘要/目录页权重，再做 topK anchor 校准和强锚点邻页校准。
+7. `BAAI/bge-reranker-v2-m3` 只在泛分析题、默认题或低置信度题上辅助，并用 anchor guard 防止 reranker 覆盖证据更强的候选页。
+8. 将 topK 页和多模态图表说明作为 answer 证据，调用 API 生成答案。
 
 ## 运行方法
 
@@ -42,7 +43,14 @@ page 选择不调用 API，流程为：
 python app/cli.py
 ```
 
-程序会读取 `财报数据库/test.json`，并把最终结果填回该文件，同时在本地生成 debug/evaluation 输出。
+程序会读取 `财报数据库/test_new.json`，并把最终结果填回该文件，同时在本地生成 debug/evaluation 输出。
+
+只做 page ablation 评测：
+```bash
+python app/page_ablation.py
+```
+
+该脚本会输出 A-F 六版 page 选择结果到 `outputs/page_ablation_test_new/`。
 
 ## 重新构建数据
 
@@ -56,7 +64,7 @@ python -m rag.vector.build_vector_db --chunks outputs/extracted_text_ocr_multimo
 
 ## 评测
 
-如果本地存在 `财报数据库/test_ground_truth.json`，运行 `app/cli.py` 后会自动输出 ROUGE-1、ROUGE-2、BLEU 等指标到 `outputs/final_evaluation.json`。
+如果本地存在 `财报数据库/test/test_new_ground_truth.json`，运行 `app/cli.py` 后会自动输出 ROUGE-1、ROUGE-2、BLEU 等指标到 `outputs/final_evaluation.json`。
 
 ## GitHub 注意事项
 

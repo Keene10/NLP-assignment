@@ -17,7 +17,9 @@ outputs/
 
 # Local models and large raw data
 m3e-small/
-财报数据库/test/
+财报数据库/test/*
+!财报数据库/test/
+!财报数据库/test/test_new_ground_truth.json
 财报数据库/test_ground_truth.json
 归档/chart_images/
 

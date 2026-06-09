@@ -526,6 +526,35 @@ def main() -> None:
         result["evaluation_output"] = str((ROOT_DIR / args.evaluation_output).resolve())
         result.update(evaluation["summary"])
 
+        # 将每个问题的评测分数写回 questions_file
+        summary = evaluation["summary"]
+        rouge1_avg = summary["answer_rouge1_avg"]
+        rouge2_avg = summary["answer_rouge2_avg"]
+        bleu_avg = summary["answer_bleu_avg"]
+        case_by_index: dict[int, dict] = {c["index"]: c for c in evaluation.get("cases", [])}
+        scored_questions = []
+        for idx, item in enumerate(questions):
+            item = dict(item)
+            case = case_by_index.get(idx)
+            if case is not None:
+                file_match = int(case.get("file_match", False))
+                page_match = int(case.get("page_match", False))
+                answer_similarity = case.get("answer_similarity_avg", 0.0)
+                item["rouge1"] = case.get("answer_rouge1", 0.0)
+                item["rouge2"] = case.get("answer_rouge2", 0.0)
+                item["bleu"] = case.get("answer_bleu", 0.0)
+                item["file_accuracy"] = file_match
+                item["page_accuracy"] = page_match
+                item["page_score"] = round(0.2 * page_match, 2)
+                item["rouge1_avg"] = rouge1_avg
+                item["rouge2_avg"] = rouge2_avg
+                item["bleu_avg"] = bleu_avg
+                item["final_score"] = round(
+                    0.2 * file_match + 0.2 * page_match + 0.6 * answer_similarity, 6
+                )
+            scored_questions.append(item)
+        write_json(args.questions_file, scored_questions, indent=4)
+
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

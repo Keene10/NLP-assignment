@@ -35,6 +35,7 @@ from config.config import (
 from rag.llm.llm import LLMService
 from rag.retriever.local_reranker import LocalPageReranker
 from rag.retriever.page_index import PageTextIndex
+from rag.retriever.segment_router import SegmentRouter
 from rag.vector.vector_db import VectorDB
 
 
@@ -1517,3 +1518,267 @@ class RAGService:
             return top_source.get("filename"), top_source.get("page")
 
         return filename, page
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical RAG Service
+# Two-stage retrieval: 1) LLM routes to segment, 2) retrieve within segment.
+# Designed for ablation experiments — set enable_hierarchical=False to fall
+# back to the standard flat RAG with identical behaviour.
+# ---------------------------------------------------------------------------
+
+import os
+
+_HIERARCHICAL_RAG_ENABLED = os.getenv("HIERARCHICAL_RAG_ENABLED", "1").strip() not in ("0", "false", "False", "")
+
+
+class HierarchicalRAGService:
+    """Wraps RAGService with optional LLM-based segment routing.
+
+    For short documents (single segment) behaviour is identical to flat RAG.
+    For long documents (e.g. 广联达再谈 131p) the LLM first selects a
+    segment, then retrieval is restricted to that page range.
+    """
+
+    def __init__(
+        self,
+        vector_db: VectorDB | None = None,
+        llm: LLMService | None = None,
+        page_index: PageTextIndex | None = None,
+        enable_hierarchical: bool | None = None,
+        router: SegmentRouter | None = None,
+    ):
+        self.base = RAGService(
+            vector_db=vector_db,
+            llm=llm,
+            page_index=page_index,
+        )
+        self._enable = (
+            enable_hierarchical
+            if enable_hierarchical is not None
+            else _HIERARCHICAL_RAG_ENABLED
+        )
+        self.router = router or SegmentRouter(llm=self.base.llm)
+
+    # ------------------------------------------------------------------
+    # Public API matching RAGService
+    # ------------------------------------------------------------------
+
+    def retrieve_pages(
+        self,
+        query: str,
+        initial_k: int = 80,
+        final_pages: int = 5,
+        score_threshold: float = 0,
+        max_chars_per_page: int = 5000,
+        reranker_model: str | None = PAGE_RERANKER_MODEL,
+        reranker_candidates: int = PAGE_RERANKER_CANDIDATES,
+        reranker_batch_size: int = PAGE_RERANKER_BATCH_SIZE,
+        reranker_max_chars: int = PAGE_RERANKER_MAX_CHARS,
+        reranker_weight: float = PAGE_RERANKER_WEIGHT,
+        restrict_reranker_to_top_file: bool = True,
+        reranker_query_mode: str = "original",
+        reranker_neighbor_pages: int = PAGE_RERANKER_NEIGHBOR_PAGES,
+        targeted_retrieval: bool = True,
+        filename: str | None = None,
+        segment_expansion: int = 2,
+    ) -> list[RetrievedPage]:
+        """Retrieve pages with optional segment boundary restriction."""
+        if not self._enable:
+            return self.base.retrieve_pages(
+                query,
+                initial_k=initial_k,
+                final_pages=final_pages,
+                score_threshold=score_threshold,
+                max_chars_per_page=max_chars_per_page,
+                reranker_model=reranker_model,
+                reranker_candidates=reranker_candidates,
+                reranker_batch_size=reranker_batch_size,
+                reranker_max_chars=reranker_max_chars,
+                reranker_weight=reranker_weight,
+                restrict_reranker_to_top_file=restrict_reranker_to_top_file,
+                reranker_query_mode=reranker_query_mode,
+                reranker_neighbor_pages=reranker_neighbor_pages,
+                targeted_retrieval=targeted_retrieval,
+            )
+
+        segment = None
+        if filename:
+            segment = self.router.route(query, filename)
+
+        if segment is None or segment.segment_id == "all":
+            # No segmentation needed — identical to flat retrieval
+            return self.base.retrieve_pages(
+                query,
+                initial_k=initial_k,
+                final_pages=final_pages,
+                score_threshold=score_threshold,
+                max_chars_per_page=max_chars_per_page,
+                reranker_model=reranker_model,
+                reranker_candidates=reranker_candidates,
+                reranker_batch_size=reranker_batch_size,
+                reranker_max_chars=reranker_max_chars,
+                reranker_weight=reranker_weight,
+                restrict_reranker_to_top_file=restrict_reranker_to_top_file,
+                reranker_query_mode=reranker_query_mode,
+                reranker_neighbor_pages=reranker_neighbor_pages,
+                targeted_retrieval=targeted_retrieval,
+            )
+
+        # Segment boundary filter
+        effective_start = max(1, segment.start_page - segment_expansion)
+        effective_end = segment.end_page + segment_expansion
+
+        # Increase initial_k because many hits will fall outside the segment
+        enlarged_k = max(initial_k * 3, 200)
+
+        pages = self.base.retrieve_pages(
+            query,
+            initial_k=enlarged_k,
+            final_pages=max(final_pages * 3, 30),
+            score_threshold=score_threshold,
+            max_chars_per_page=max_chars_per_page,
+            reranker_model=reranker_model,
+            reranker_candidates=reranker_candidates,
+            reranker_batch_size=reranker_batch_size,
+            reranker_max_chars=reranker_max_chars,
+            reranker_weight=reranker_weight,
+            restrict_reranker_to_top_file=restrict_reranker_to_top_file,
+            reranker_query_mode=reranker_query_mode,
+            reranker_neighbor_pages=reranker_neighbor_pages,
+            targeted_retrieval=targeted_retrieval,
+        )
+
+        # Filter to segment range and re-rank by original score
+        filtered = []
+        for page in pages:
+            try:
+                p = int(page.page_number)
+            except (ValueError, TypeError):
+                continue
+            if p < effective_start or p > effective_end:
+                continue
+            filtered.append(page)
+
+        if not filtered:
+            # Safety fallback: if segment-filtered retrieval yields nothing,
+            # fall back to flat retrieval so we never return empty.
+            return self.base.retrieve_pages(
+                query,
+                initial_k=initial_k,
+                final_pages=final_pages,
+                score_threshold=score_threshold,
+                max_chars_per_page=max_chars_per_page,
+                reranker_model=reranker_model,
+                reranker_candidates=reranker_candidates,
+                reranker_batch_size=reranker_batch_size,
+                reranker_max_chars=reranker_max_chars,
+                reranker_weight=reranker_weight,
+                restrict_reranker_to_top_file=restrict_reranker_to_top_file,
+                reranker_query_mode=reranker_query_mode,
+                reranker_neighbor_pages=reranker_neighbor_pages,
+                targeted_retrieval=targeted_retrieval,
+            )
+
+        # Sort by original score descending and take final_pages
+        filtered.sort(key=lambda p: float(p.score), reverse=True)
+        return filtered[:final_pages]
+
+    def answer_structured(
+        self,
+        query: str,
+        initial_k: int = 80,
+        final_pages: int = 5,
+        max_chars_per_page: int = 5000,
+        run_llm: bool = True,
+        include_prompt: bool = False,
+        filename: str | None = None,
+    ) -> dict:
+        pages = self.retrieve_pages(
+            query,
+            initial_k=initial_k,
+            final_pages=final_pages,
+            max_chars_per_page=max_chars_per_page,
+            filename=filename,
+        )
+        if not pages:
+            return {
+                "filename": "",
+                "page": -1,
+                "answer": "未检索到相关片段",
+                "sources": [],
+                "llm_used": False,
+                "raw_answer": "",
+                "error": "no_retrieval_hits",
+                **({"prompt": ""} if include_prompt else {}),
+            }
+
+        prompt = self.base.build_prompt(query, pages)
+        sources = self.base._format_sources(pages)
+        fallback = StructuredAnswer(
+            filename=pages[0].filename,
+            page=pages[0].page_number,
+            answer="",
+            sources=sources,
+            prompt=prompt,
+            llm_used=False,
+        )
+
+        if not run_llm:
+            fallback.error = "llm_not_run"
+            result = fallback.to_dict(include_prompt=include_prompt)
+            result["hierarchical_enabled"] = self._enable
+            return result
+
+        if not self.base.llm.available:
+            fallback.error = "llm_unavailable: OPENAI_API_KEY is empty"
+            result = fallback.to_dict(include_prompt=include_prompt)
+            result["hierarchical_enabled"] = self._enable
+            return result
+
+        try:
+            raw_answer = self.base.llm.generate(prompt)
+        except Exception as exc:
+            fallback.error = f"llm_exception: {exc}"
+            result = fallback.to_dict(include_prompt=include_prompt)
+            result["hierarchical_enabled"] = self._enable
+            return result
+
+        parsed = self.base.parse_structured_answer(raw_answer)
+        if not parsed:
+            fallback.answer = raw_answer.strip()
+            fallback.raw_answer = raw_answer
+            fallback.llm_used = True
+            fallback.error = "llm_output_not_json"
+            result = fallback.to_dict(include_prompt=include_prompt)
+            result["hierarchical_enabled"] = self._enable
+            return result
+
+        filename_out = parsed.get("filename") or pages[0].filename
+        page = self.base._normalize_page_value(parsed.get("page") or pages[0].page_number)
+        valid_sources = {(source["filename"], str(source["page"])) for source in sources}
+        if (filename_out, str(page)) not in valid_sources:
+            filename_out = pages[0].filename
+            page = pages[0].page_number
+        else:
+            filename_out, page = self.base._maybe_override_source(filename_out, page, sources)
+        answer = parsed.get("answer") or ""
+
+        result = StructuredAnswer(
+            filename=filename_out,
+            page=page,
+            answer=answer,
+            sources=sources,
+            prompt=prompt,
+            raw_answer=raw_answer,
+            llm_used=True,
+        ).to_dict(include_prompt=include_prompt)
+        result["hierarchical_enabled"] = self._enable
+        return result
+
+    def answer_forced_page(self, *args, **kwargs):
+        """Delegate to base RAGService."""
+        return self.base.answer_forced_page(*args, **kwargs)
+
+    def answer(self, query: str, **kwargs):
+        return self.answer_structured(query, **kwargs)

@@ -185,7 +185,7 @@ def main() -> None:
                     run_llm=args.run_llm,
                 )
             else:
-                result = rag.answer_structured_hierarchical(
+                result = rag.answer_structured(
                     question,
                     filename=filename,
                     initial_k=args.initial_k,

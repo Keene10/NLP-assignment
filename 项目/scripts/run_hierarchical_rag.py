@@ -27,7 +27,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from config.config import RETRIEVAL_CHUNKS_PATH
-from rag.retriever.rag import HierarchicalRAGService
+from rag.retriever.unified_rag import UnifiedRAGService
 from rag.vector.vector_db import VectorDB
 
 
@@ -166,7 +166,7 @@ def main() -> None:
         from rag.retriever.rag import RAGService
         rag = RAGService(vector_db=vector_db)
     else:
-        rag = HierarchicalRAGService(vector_db=vector_db)
+        rag = UnifiedRAGService(vector_db=vector_db)
 
     predictions = []
     debug_items = []
@@ -177,21 +177,17 @@ def main() -> None:
 
         try:
             if args.skip_hierarchical:
-                result = rag.answer_structured(
+                result = rag.answer(
                     question,
-                    initial_k=args.initial_k,
-                    final_pages=args.final_pages,
-                    max_chars_per_page=args.max_chars_per_page,
                     run_llm=args.run_llm,
+                    max_chars_per_page=args.max_chars_per_page,
                 )
             else:
-                result = rag.answer_structured(
+                result = rag.answer(
                     question,
                     filename=filename,
-                    initial_k=args.initial_k,
-                    final_pages=args.final_pages,
-                    max_chars_per_page=args.max_chars_per_page,
                     run_llm=args.run_llm,
+                    max_chars_per_page=args.max_chars_per_page,
                 )
         except Exception as exc:
             result = {

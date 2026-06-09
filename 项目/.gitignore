@@ -1,5 +1,30 @@
-outputs/
-# 排除大模型文件
-models/*.safetensors
+# Secrets
+.env
+
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+
+# IDE/system files
+.idea/
+.vscode/
+.DS_Store
+
+# Generated runtime artifacts
+outputs/
+*.log
+
+# Local models and large raw data
+m3e-small/
+models/
+财报数据库/test/*
+!财报数据库/test/
+!财报数据库/test/test_new_ground_truth.json
+财报数据库/test_ground_truth.json
+归档/chart_images/
+
+# Virtual environments
+.venv/
+venv/
+env/

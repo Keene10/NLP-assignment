@@ -1,10 +1,10 @@
-# 核心依赖
+# Core dependencies
 langchain
 langchain-openai
 langchain-community
 langchain-chroma
 
-# 文档处理
+# Document processing
 pypdf
 pdfplumber
 PyMuPDF
@@ -13,21 +13,24 @@ python-docx
 markdown
 beautifulsoup4
 
-# 向量模型
+# Embedding and reranking
 sentence-transformers
+FlagEmbedding
+transformers
+torch
 
-# 数据库
+# Vector database
 chromadb
 faiss-cpu
 
-# Web框架
+# Web app
 fastapi
 uvicorn
 streamlit
 
-# 工具
+# Utilities
 python-dotenv
 rich
 
-# 测试
+# Tests
 pytest

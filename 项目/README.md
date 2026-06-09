@@ -1,103 +1,82 @@
-# RAG 智能问答系统（含多模态图表增强）
+# RAG 智能问答系统
 
-本项目用于金融研报问答：读取 PDF 研报，完成 OCR/表格增强文本抽取、**多模态图表描述**、向量检索、候选页选择，并调用大模型生成答案。
+本项目用于金融研报问答：读取 PDF 研报，完成 OCR/表格/多模态图表说明增强、向量检索、BM25 检索、候选页重排序，并调用大模型生成最终答案。
 
 ## 目录结构
 
-- `app/cli.py`：最终一键运行入口，会把结果直接填写到 `财报数据库/test.json`。
-- `app/streamlit_app.py`：原始 Streamlit Web 界面。
-- `rag/document/`：文档加载、PDF/OCR/表格抽取、文本切分。
-- `rag/vector/`：嵌入模型和向量库封装。
-- `rag/retriever/`：RAG 检索、证据页选择、Prompt 构建和回答生成。
-- `config/config.py`：模型、向量库、路径等配置。
+- `app/cli.py`：最终一键运行入口，会把 `filename/page/answer` 直接填回 `财报数据库/test_new.json`。
+- `app/streamlit_app.py`：原始 Streamlit Web 页面。
+- `config/config.py`：模型、路径、检索权重、reranker、Top-K 等配置。
+- `rag/document/`：PDF 加载、OCR/表格提取、文本切分、多模态图表说明合并。
+- `rag/vector/`：embedding 模型和向量库封装。
+- `rag/retriever/`：RAG 主逻辑、本地 page 检索、reranker、prompt 构造、指标评测。
+- `rag/llm/`：大模型 API 调用封装。
 - `tests/`：基础测试。
-- `财报数据库/`：测试问题、PDF 数据、标准答案。
-- `outputs/`：中间产物（图表描述 JSON、页码计划、评测结果等）。
-- **`scripts/`：新增工具脚本**
-  - `detect_chart_pages.py`：检测 PDF 中包含图表/表格的页码。
-  - `describe_charts_with_qwenvl.py`：调用 Qwen3-VL API 对图表页生成结构化描述。
+- `归档/chart_descriptions/`：多模态模型生成的图表/页面说明，用于补充原始文本。
+- `财报数据库/`：测试问题文件与本地数据。
 
-## 环境准备
+## 当前正式流程
 
-```bash
-pip install -r requirements.txt
-```
+当前默认使用增强版数据：
 
-在 `.env` 中填写 API key（用于主流程的大模型调用）。
+- 文本数据：`outputs/extracted_text_ocr_multimodal/chunks.jsonl`
+- 向量库：`outputs/vector_db_multimodal`
 
-> **注意**：多模态图表描述需要阿里云百炼 API Key，请配置环境变量：
-> ```bash
-> export DASHSCOPE_API_KEY="sk-xxxx"
-> ```
+page 选择不调用 API，默认使用 `calibrated` 本地页码计划：
 
-## 运行
+1. m3e embedding 向量检索。
+2. BM25 关键词检索。
+3. exact phrase、年份/数字/图表编号、业务词等规则加权。
+4. 图表直达页、图表目录页惩罚、自动章节语义路由。
+5. hybrid topK 候选页进入通用锚点校准，锚点包括年份、季度、图表编号、数字单位、财务指标、英文数字实体、引号短语、实体短语和列表形态。
+6. 对细节型问题选择性降低前 1-3 页摘要/目录页权重，再做 topK anchor 校准和强锚点邻页校准。
+7. `BAAI/bge-reranker-v2-m3` 只在泛分析题、默认题或低置信度题上辅助，并用 anchor guard 防止 reranker 覆盖证据更强的候选页。
+8. 将 topK 页和多模态图表说明作为 answer 证据，调用 API 生成答案。
 
-### 方式一：主流程（已有文本增强）
+默认运行方式与本地实验保持一致：`app/cli.py` 会设置 `TRANSFORMERS_OFFLINE=1` 和
+`HF_HUB_OFFLINE=1`，所以 `BAAI/bge-reranker-v2-m3` 不会联网下载，而是从本机
+HuggingFace 缓存或项目内模型目录加载。若要把项目打包给队友完全复现，可以：
+
+- 保持 `PAGE_RERANKER_MODEL=BAAI/bge-reranker-v2-m3`，要求队友本机已有该模型缓存；
+- 或把模型放到 `models/bge-reranker-v2-m3`，并将 `.env` 中的
+  `PAGE_RERANKER_MODEL` 留空或改成 `./models/bge-reranker-v2-m3`。
+
+`STRICT_LOCAL_RERANKER=1` 为默认值。reranker 缺失时程序会直接报错，避免静默降级后
+跑出不可比的 page 结果。
+
+## 运行方法
+
+先根据 `.env.example` 创建 `.env`，填入自己的 API Key。
+
+直接运行完整流程：
 
 ```bash
 python app/cli.py
 ```
 
-程序会按顺序执行：
+程序会读取 `财报数据库/test_new.json`，并把最终结果填回该文件，同时在本地生成 debug/evaluation 输出。
 
-1. 读取 `财报数据库/test.json` 中的问题。
-2. 使用本地 OCR 增强文本和向量库获得基础候选页。
-3. 调用同一个 API 模型做"证据页选择"，只选页码，不生成答案。
-4. 在选中页及相邻页上下文中生成答案。
-5. 将 `filename`、`page`、`answer` 直接填回 `财报数据库/test.json`，保留原有 `question` 和 JSON 数组结构。
-6. 如果存在 `财报数据库/test_ground_truth.json`，会在本地生成最新评测 `outputs/final_evaluation.json`。
-
-常用参数：
-
+只做 page ablation 评测：
 ```bash
-python app/cli.py --resume
-python app/cli.py --skip-page-selector
-python app/cli.py --use-existing-selected-page-plan
+python app/page_ablation.py
 ```
 
-### 方式二：多模态图表描述增强（新增）
+该脚本会输出 A-F 六版 page 选择结果到 `outputs/page_ablation_test_new/`。
 
-针对 PDF 中的图表/表格页面，使用 Qwen3-VL 生成结构化描述，供 RAG 系统使用。
+## 重新构建数据
 
-**Step 1：检测图表页**
-
-```bash
-python scripts/detect_chart_pages.py
-```
-
-- 解析 PDF 图表目录或扫描页面内联标记，识别包含图表的页码。
-- 输出 `outputs/chart_pages.json`，记录每个 PDF 的图表页列表。
-
-**Step 2：生成图表描述**
+如果需要从原始 PDF 重新构建：
 
 ```bash
-python scripts/describe_charts_with_qwenvl.py --model qwen3-vl-plus --dpi 150
+python -m rag.document.prepare_documents --input-dir 财报数据库/test --output-dir outputs/extracted_text_ocr --recreate --progress
+python -m rag.document.augment_chunks_with_chart_descriptions --chunks outputs/extracted_text_ocr/chunks.jsonl --chart-description-dir 归档/chart_descriptions --output-dir outputs/extracted_text_ocr_multimodal
+python -m rag.vector.build_vector_db --chunks outputs/extracted_text_ocr_multimodal/chunks.jsonl --vector-db-path outputs/vector_db_multimodal --backend simple --recreate
 ```
 
-- 将图表页渲染为图片，调用阿里云百炼 Qwen3-VL API。
-- 生成结构化 JSON 描述（类型、标题、关键数据、趋势结论）。
-- 结果保存在 `outputs/chart_descriptions/`。
+## 评测
 
-> 首次运行前建议加 `--dry-run` 只生成截图，确认质量后再正式调用 API：
-> ```bash
-> python scripts/describe_charts_with_qwenvl.py --dry-run
-> ```
+如果本地存在 `财报数据库/test/test_new_ground_truth.json`，运行 `app/cli.py` 后会自动输出 ROUGE-1、ROUGE-2、BLEU 等指标到 `outputs/final_evaluation.json`。
 
-## 多模态描述字段说明
+## GitHub 注意事项
 
-每个图表的描述包含以下字段：
-
-| 字段 | 说明 |
-|------|------|
-| `chart_type` | 图表类型：`table` / `bar_chart` / `line_chart` / `pie_chart` / `diagram` / `image` |
-| `title` | 图表标题 |
-| `one_liner` | 最精简的一句话总结（含关键数字），适合向量检索 |
-| `key_entities` | 关键实体列表（数字、公司名、年份等） |
-| `detailed_facts` | 较详细的事实描述，供生成答案时参考 |
-| `trend_conclusion` | 数据趋势或结论 |
-
-## 注意事项
-
-1. **GitHub 不托管大文件**：`.gitignore` 已排除模型文件（`m3e-small/`）、PDF 截图（`chart_images/`）和 OCR 缓存。队友 clone 后需自行下载模型或重新运行脚本生成。
-2. **免费额度**：Qwen3-VL-Plus 有百万级 Token 免费额度，230 页图表描述约消耗 60~70 万 Token，完全够用。
-3. **页码检测策略**：不同 PDF 采用不同检测策略（目录解析 / 资料来源 / 内联标记），详见 `scripts/detect_chart_pages.py` 注释。
+不要上传 `.env`、API Key、`outputs/`、本地模型目录、PDF 原始数据或向量库。仓库只需要保留代码、配置模板、说明文档和必要的小型辅助数据。

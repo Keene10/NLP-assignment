@@ -5,15 +5,11 @@ import json
 import shutil
 import sys
 from pathlib import Path
-
-from langchain_core.documents import Document
+from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-
-from rag.document.processor import DocumentProcessor
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -42,7 +38,7 @@ def safe_name(name: str) -> str:
     return "".join(char if char not in '<>:"/\\|?*' else "_" for char in name)
 
 
-def document_key(document: Document) -> tuple[str, int]:
+def document_key(document: Any) -> tuple[str, int]:
     metadata = document.metadata or {}
     return (
         metadata.get("filename") or Path(metadata.get("source", "")).name,
@@ -50,7 +46,7 @@ def document_key(document: Document) -> tuple[str, int]:
     )
 
 
-def write_page_files(output_dir: Path, documents: list[Document]) -> None:
+def write_page_files(output_dir: Path, documents: list[Any]) -> None:
     pages_dir = output_dir / "pages"
     all_pages = []
     for document in documents:
@@ -65,7 +61,7 @@ def write_page_files(output_dir: Path, documents: list[Document]) -> None:
     (output_dir / "all_pages.md").write_text("\n\n".join(all_pages), encoding="utf-8")
 
 
-def write_chunk_files(output_dir: Path, chunks: list[Document]) -> None:
+def write_chunk_files(output_dir: Path, chunks: list[Any]) -> None:
     chunks_dir = output_dir / "chunks"
     rows = []
     markdown_blocks = []
@@ -92,7 +88,7 @@ def write_chunk_files(output_dir: Path, chunks: list[Document]) -> None:
     (output_dir / "all_chunks.md").write_text("\n\n".join(markdown_blocks), encoding="utf-8")
 
 
-def write_manifest(output_dir: Path, documents: list[Document], chunks: list[Document], args: argparse.Namespace) -> None:
+def write_manifest(output_dir: Path, documents: list[Any], chunks: list[Any], args: argparse.Namespace) -> None:
     by_file: dict[str, dict] = {}
     for document in documents:
         metadata = document.metadata or {}
@@ -130,6 +126,8 @@ def write_manifest(output_dir: Path, documents: list[Document], chunks: list[Doc
 
 
 def main() -> None:
+    from rag.document.processor import DocumentProcessor
+
     args = parse_args()
     input_dir = resolve_path(args.input_dir)
     output_dir = resolve_path(args.output_dir)

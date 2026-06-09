@@ -1,1 +1,5 @@
 outputs/
+# 排除大模型文件
+models/*.safetensors
+__pycache__/
+*.pyc
